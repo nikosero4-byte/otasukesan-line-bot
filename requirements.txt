@@ -1,0 +1,4 @@
+Flask>=3.0,<4
+gunicorn>=22,<24
+openai>=1.40,<3
+requests>=2.31,<3
