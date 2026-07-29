@@ -3,29 +3,102 @@ import hashlib
 import hmac
 import logging
 import os
+import re
+import threading
+import time
+from collections import defaultdict, deque
+from typing import Deque, Dict, List
 
 import requests
 from flask import Flask, abort, jsonify, request
 from openai import OpenAI
 
+# =========================================================
+# おたすけさん Ver1.1
+# ・LINE向け短文返信
+# ・最大3つの吹き出し
+# ・ユーザーごとの直近会話を一時保持
+# ・エラー時の返信／pushフォールバック
+# ・Renderログ強化
+#
+# 注意：
+# 会話履歴はサーバーのメモリ内にだけ保存します。
+# Renderの再起動・再デプロイ・スリープ復帰などで消えることがあります。
+# =========================================================
+
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = app.logger
 
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
+LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
+
+MAX_HISTORY_MESSAGES = 8
+MAX_REPLY_BUBBLES = 3
+MAX_BUBBLE_CHARS = 900
+EVENT_CACHE_LIMIT = 500
+
 SYSTEM_PROMPT = """
 あなたはLINE相談ボット「おたすけさん」です。
-日本語で、親しみやすく、落ち着いた口調で回答してください。
-最初に相手の話を受け止め、要点を整理し、次に取れる行動を分かりやすく示してください。
-回答はLINEで読みやすい長さにし、必要以上に長くしないでください。
-医療・介護・法律・お金など重要な相談では、断定せず、専門家や公的窓口への確認も案内してください。
-緊急性や生命の危険が疑われる場合は、119番など適切な緊急窓口への連絡を優先して案内してください。
-個人情報や秘密情報をむやみに尋ねないでください。
-現在は試作版で、会話内容を長期記憶する機能はありません。
+日本語で、親しみやすく、穏やかで、押しつけない口調で回答してください。
+
+【基本姿勢】
+・最初に相手の話を短く受け止める。
+・「大丈夫ですか？」を安易に繰り返さない。
+・分からないことを知っているように断言しない。
+・個人情報や秘密情報をむやみに尋ねない。
+・現在地や直前の話題など、会話履歴にある情報を自然に引き継ぐ。
+
+【LINEでの返信ルール】
+・1回の回答は短くする。
+・原則として、次の順番で最大3つの短い吹き出しにする。
+  1. 共感・受け止め
+  2. 確認質問または要点
+  3. 次にできる行動
+・質問は一度に原則1つまで。
+・詳しい説明は、相手が求めた場合に追加する。
+・各吹き出しの区切りには、必ず半角の ||| を使う。
+・箇条書きを多用せず、スマートフォンで読みやすくする。
+・回答全体を必要以上に長くしない。
+
+【安全上のルール】
+・医療、介護、法律、お金など重要な相談では断定を避ける。
+・緊急性や生命の危険が疑われる場合は、119番など適切な緊急窓口への連絡を優先する。
+・自傷、他害、重大な犯罪などの危険がある場合は、安全確保と緊急支援を優先する。
+
+【現在の機能上の制限】
+・リアルタイムの天気、電車時刻、道路状況、店舗の営業状況などを、
+  外部APIなしで正確に取得することはできない。
+・最新情報を取得できない場合は、推測で答えず、
+  「現在は最新情報を直接確認できません」と短く伝える。
+・ただし、直前に出た地名や話題は忘れず、会話として自然につなげる。
+
+【出力例】
+それはつらいですね。|||動くときに強く痛みますか？|||無理に動かさず、急な強い痛みやしびれがあれば医療機関への相談も検討してください。
 """.strip()
+
+# OpenAIクライアントは使い回す
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# ユーザーごとの一時的な会話履歴
+conversation_history: Dict[str, Deque[dict]] = defaultdict(
+    lambda: deque(maxlen=MAX_HISTORY_MESSAGES)
+)
+history_lock = threading.Lock()
+
+# LINEのWebhook再送による二重返信を避けるための簡易キャッシュ
+processed_event_ids: Deque[str] = deque(maxlen=EVENT_CACHE_LIMIT)
+processed_event_set = set()
+event_lock = threading.Lock()
 
 
 def verify_line_signature(body: bytes, signature: str) -> bool:
@@ -42,88 +115,356 @@ def verify_line_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def create_ai_reply(user_text: str) -> str:
-    """OpenAI APIで返信文を作る。"""
-    if not OPENAI_API_KEY:
-        return "ただいまAIの設定準備中です。少し時間をおいて、もう一度お試しください。"
+def get_conversation_key(event: dict) -> str:
+    """ユーザー・グループ・ルームごとに会話を分ける。"""
+    source = event.get("source", {})
+    source_type = source.get("type", "unknown")
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    response = client.responses.create(
+    if source_type == "user":
+        return f"user:{source.get('userId', 'unknown')}"
+
+    if source_type == "group":
+        return (
+            f"group:{source.get('groupId', 'unknown')}:"
+            f"user:{source.get('userId', 'unknown')}"
+        )
+
+    if source_type == "room":
+        return (
+            f"room:{source.get('roomId', 'unknown')}:"
+            f"user:{source.get('userId', 'unknown')}"
+        )
+
+    return "unknown"
+
+
+def get_push_target(event: dict) -> str:
+    """replyTokenが使えない場合にpush送信する宛先を取得する。"""
+    source = event.get("source", {})
+    return (
+        source.get("userId")
+        or source.get("groupId")
+        or source.get("roomId")
+        or ""
+    )
+
+
+def is_duplicate_event(event: dict) -> bool:
+    """同じWebhookイベントの二重処理を避ける。"""
+    event_id = event.get("webhookEventId")
+    if not event_id:
+        return False
+
+    with event_lock:
+        if event_id in processed_event_set:
+            return True
+
+        if len(processed_event_ids) >= EVENT_CACHE_LIMIT:
+            old_id = processed_event_ids.popleft()
+            processed_event_set.discard(old_id)
+
+        processed_event_ids.append(event_id)
+        processed_event_set.add(event_id)
+
+    return False
+
+
+def load_history(conversation_key: str) -> List[dict]:
+    with history_lock:
+        return list(conversation_history[conversation_key])
+
+
+def save_history(conversation_key: str, role: str, content: str) -> None:
+    with history_lock:
+        conversation_history[conversation_key].append(
+            {"role": role, "content": content}
+        )
+
+
+def clear_history(conversation_key: str) -> None:
+    with history_lock:
+        conversation_history.pop(conversation_key, None)
+
+
+def split_long_text(text: str, limit: int = MAX_BUBBLE_CHARS) -> List[str]:
+    """長すぎる文章を、文の切れ目を優先して分割する。"""
+    text = text.strip()
+    if not text:
+        return []
+
+    if len(text) <= limit:
+        return [text]
+
+    sentences = re.split(r"(?<=[。！？!?])", text)
+    chunks: List[str] = []
+    current = ""
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        if len(current) + len(sentence) <= limit:
+            current += sentence
+            continue
+
+        if current:
+            chunks.append(current.strip())
+            current = ""
+
+        while len(sentence) > limit:
+            chunks.append(sentence[:limit].strip())
+            sentence = sentence[limit:]
+
+        current = sentence
+
+    if current:
+        chunks.append(current.strip())
+
+    return chunks
+
+
+def format_line_messages(answer: str) -> List[str]:
+    """AIの回答を最大3つのLINE吹き出しへ整形する。"""
+    answer = (answer or "").strip()
+    if not answer:
+        return ["うまく回答を作れませんでした。もう一度送ってください。"]
+
+    raw_parts = [part.strip() for part in answer.split("|||") if part.strip()]
+
+    # AIが区切りを守らなかった場合も読みやすく分割する
+    if len(raw_parts) <= 1:
+        raw_parts = split_long_text(answer)
+
+    messages: List[str] = []
+    for part in raw_parts:
+        messages.extend(split_long_text(part))
+
+    messages = [message[:MAX_BUBBLE_CHARS] for message in messages if message]
+
+    if not messages:
+        messages = ["うまく回答を作れませんでした。もう一度送ってください。"]
+
+    # LINEは最大5件だが、おたすけさんでは最大3件に抑える
+    if len(messages) > MAX_REPLY_BUBBLES:
+        remaining = " ".join(messages[MAX_REPLY_BUBBLES - 1 :])
+        messages = messages[: MAX_REPLY_BUBBLES - 1]
+        messages.append(remaining[:MAX_BUBBLE_CHARS])
+
+    return messages
+
+
+def create_ai_reply(conversation_key: str, user_text: str) -> str:
+    """直近の会話履歴を含めてOpenAI APIから返信を作る。"""
+    if not openai_client:
+        return (
+            "ただいまAIの設定準備中です。|||"
+            "少し時間をおいて、もう一度お試しください。"
+        )
+
+    history = load_history(conversation_key)
+    api_input = history + [{"role": "user", "content": user_text}]
+
+    logger.info(
+        "STEP 3 OpenAIへ送信 conversation=%s history=%d model=%s",
+        conversation_key,
+        len(history),
+        OPENAI_MODEL,
+    )
+
+    response = openai_client.responses.create(
         model=OPENAI_MODEL,
         instructions=SYSTEM_PROMPT,
-        input=user_text,
-        max_output_tokens=500,
+        input=api_input,
+        max_output_tokens=450,
     )
+
     reply = (response.output_text or "").strip()
-
     if not reply:
-        return "うまく回答を作れませんでした。少し言い方を変えて、もう一度送ってください。"
+        raise RuntimeError("OpenAIから空の回答が返されました。")
 
-    # LINEのテキスト上限に余裕を持たせる
-    return reply[:4500]
+    save_history(conversation_key, "user", user_text)
+    save_history(conversation_key, "assistant", reply)
+
+    return reply
 
 
-def reply_to_line(reply_token: str, text: str) -> None:
-    """LINE Messaging APIで返信する。"""
+def line_headers() -> dict:
     if not LINE_CHANNEL_ACCESS_TOKEN:
         raise RuntimeError("LINE_CHANNEL_ACCESS_TOKEN が設定されていません。")
 
+    return {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+def to_line_message_objects(texts: List[str]) -> List[dict]:
+    return [{"type": "text", "text": text} for text in texts[:5]]
+
+
+def reply_to_line(reply_token: str, texts: List[str]) -> None:
+    """replyTokenを使ってLINEへ返信する。"""
     response = requests.post(
-        "https://api.line.me/v2/bot/message/reply",
-        headers={
-            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-            "Content-Type": "application/json",
-        },
+        LINE_REPLY_URL,
+        headers=line_headers(),
         json={
             "replyToken": reply_token,
-            "messages": [{"type": "text", "text": text}],
+            "messages": to_line_message_objects(texts),
         },
-        timeout=15,
+        timeout=20,
     )
+
+    if not response.ok:
+        logger.error(
+            "LINE reply失敗 status=%s body=%s",
+            response.status_code,
+            response.text[:1000],
+        )
+
     response.raise_for_status()
+
+
+def push_to_line(target: str, texts: List[str]) -> None:
+    """replyTokenが期限切れ等の場合、push送信を試す。"""
+    if not target:
+        raise RuntimeError("push送信先を取得できませんでした。")
+
+    response = requests.post(
+        LINE_PUSH_URL,
+        headers=line_headers(),
+        json={
+            "to": target,
+            "messages": to_line_message_objects(texts),
+        },
+        timeout=20,
+    )
+
+    if not response.ok:
+        logger.error(
+            "LINE push失敗 status=%s body=%s",
+            response.status_code,
+            response.text[:1000],
+        )
+
+    response.raise_for_status()
+
+
+def send_with_fallback(
+    reply_token: str,
+    push_target: str,
+    texts: List[str],
+) -> None:
+    """通常返信に失敗した場合、push送信へ切り替える。"""
+    try:
+        reply_to_line(reply_token, texts)
+        logger.info("STEP 5 LINE reply成功 bubbles=%d", len(texts))
+    except Exception:
+        logger.exception("LINE replyに失敗しました。push送信を試します。")
+        push_to_line(push_target, texts)
+        logger.info("STEP 5 LINE push成功 bubbles=%d", len(texts))
 
 
 @app.get("/")
 def health_check():
     return jsonify(
         status="ok",
+        version="1.1",
         service="おたすけさんLINEボット",
         message="サーバーは正常に動いています。",
+        openai_configured=bool(OPENAI_API_KEY),
+        line_configured=bool(
+            LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN
+        ),
     )
 
 
 @app.post("/callback")
 def callback():
+    started_at = time.time()
     raw_body = request.get_data()
     signature = request.headers.get("X-Line-Signature", "")
 
+    logger.info("STEP 1 Webhook受信 bytes=%d", len(raw_body))
+
     if not verify_line_signature(raw_body, signature):
-        app.logger.warning("LINE署名の確認に失敗しました。")
+        logger.warning("LINE署名の確認に失敗しました。")
         abort(400)
 
     payload = request.get_json(silent=True) or {}
+    events = payload.get("events", [])
 
-    # LINE Developersの「検証」では events が空の場合がある
-    for event in payload.get("events", []):
+    logger.info("STEP 2 署名確認成功 events=%d", len(events))
+
+    # LINE Developersの「検証」ではeventsが空の場合がある
+    for event in events:
+        if is_duplicate_event(event):
+            logger.info("重複イベントのためスキップしました。")
+            continue
+
         if event.get("type") != "message":
+            logger.info("message以外のイベントをスキップしました。")
             continue
 
         message = event.get("message", {})
         if message.get("type") != "text":
+            logger.info("テキスト以外のメッセージをスキップしました。")
             continue
 
-        reply_token = event.get("replyToken")
+        reply_token = event.get("replyToken", "")
+        push_target = get_push_target(event)
+        conversation_key = get_conversation_key(event)
         user_text = (message.get("text") or "").strip()
+
         if not reply_token or not user_text:
+            logger.warning("replyTokenまたは本文が空のためスキップしました。")
+            continue
+
+        logger.info(
+            "受信 conversation=%s text_length=%d",
+            conversation_key,
+            len(user_text),
+        )
+
+        # 利用者が明示的に会話をリセットできる
+        if user_text in {"会話をリセット", "履歴を消して", "リセット"}:
+            clear_history(conversation_key)
+            reset_messages = ["分かりました。|||ここまでの会話をリセットしました。"]
+            send_with_fallback(
+                reply_token,
+                push_target,
+                format_line_messages(reset_messages[0]),
+            )
             continue
 
         try:
-            answer = create_ai_reply(user_text)
-            reply_to_line(reply_token, answer)
-        except Exception:
-            app.logger.exception("返信処理でエラーが発生しました。")
-            # LINEには200を返し、同じWebhookの再送が繰り返されるのを避ける
+            answer = create_ai_reply(conversation_key, user_text)
+            logger.info("STEP 4 AI回答生成成功 length=%d", len(answer))
 
+            line_messages = format_line_messages(answer)
+            send_with_fallback(reply_token, push_target, line_messages)
+
+        except Exception:
+            logger.exception("返信処理でエラーが発生しました。")
+
+            fallback_messages = [
+                "うまく処理できませんでした。",
+                "少し時間をおいて、もう一度送ってください。",
+            ]
+
+            try:
+                send_with_fallback(
+                    reply_token,
+                    push_target,
+                    fallback_messages,
+                )
+            except Exception:
+                logger.exception("フォールバックメッセージの送信にも失敗しました。")
+
+    logger.info(
+        "Webhook処理完了 elapsed=%.2fs",
+        time.time() - started_at,
+    )
     return "OK", 200
 
 
