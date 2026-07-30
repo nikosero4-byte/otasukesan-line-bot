@@ -379,6 +379,75 @@ def health_check():
     )
 
 
+def process_event_async(event: dict) -> None:
+    """Webhookへの200応答後に、実際の返信処理を行う。"""
+    try:
+        if is_duplicate_event(event):
+            logger.info("重複イベントのためスキップしました。")
+            return
+
+        if event.get("type") != "message":
+            logger.info("message以外のイベントをスキップしました。")
+            return
+
+        message = event.get("message", {})
+        if message.get("type") != "text":
+            logger.info("テキスト以外のメッセージをスキップしました。")
+            return
+
+        push_target = get_push_target(event)
+        conversation_key = get_conversation_key(event)
+        user_text = (message.get("text") or "").strip()
+
+        if not push_target or not user_text:
+            logger.warning("push送信先または本文が空のためスキップしました。")
+            return
+
+        logger.info(
+            "非同期処理開始 conversation=%s text_length=%d",
+            conversation_key,
+            len(user_text),
+        )
+
+        if user_text in {"会話をリセット", "履歴を消して", "リセット"}:
+            clear_history(conversation_key)
+            push_to_line(
+                push_target,
+                format_line_messages(
+                    "分かりました。|||ここまでの会話をリセットしました。"
+                ),
+            )
+            return
+
+        answer = create_ai_reply(conversation_key, user_text)
+        logger.info("AI回答生成成功 length=%d", len(answer))
+
+        line_messages = format_line_messages(answer)
+        push_to_line(push_target, line_messages)
+
+        logger.info(
+            "LINE push成功 conversation=%s bubbles=%d",
+            conversation_key,
+            len(line_messages),
+        )
+
+    except Exception:
+        logger.exception("非同期返信処理でエラーが発生しました。")
+
+        try:
+            push_target = get_push_target(event)
+            if push_target:
+                push_to_line(
+                    push_target,
+                    [
+                        "うまく処理できませんでした。",
+                        "少し時間をおいて、もう一度送ってください。",
+                    ],
+                )
+        except Exception:
+            logger.exception("フォールバック送信にも失敗しました。")
+
+
 @app.post("/callback")
 def callback():
     started_at = time.time()
@@ -396,75 +465,19 @@ def callback():
 
     logger.info("STEP 2 署名確認成功 events=%d", len(events))
 
-    # LINE Developersの「検証」ではeventsが空の場合がある
     for event in events:
-        if is_duplicate_event(event):
-            logger.info("重複イベントのためスキップしました。")
-            continue
-
-        if event.get("type") != "message":
-            logger.info("message以外のイベントをスキップしました。")
-            continue
-
-        message = event.get("message", {})
-        if message.get("type") != "text":
-            logger.info("テキスト以外のメッセージをスキップしました。")
-            continue
-
-        reply_token = event.get("replyToken", "")
-        push_target = get_push_target(event)
-        conversation_key = get_conversation_key(event)
-        user_text = (message.get("text") or "").strip()
-
-        if not reply_token or not user_text:
-            logger.warning("replyTokenまたは本文が空のためスキップしました。")
-            continue
-
-        logger.info(
-            "受信 conversation=%s text_length=%d",
-            conversation_key,
-            len(user_text),
-        )
-
-        # 利用者が明示的に会話をリセットできる
-        if user_text in {"会話をリセット", "履歴を消して", "リセット"}:
-            clear_history(conversation_key)
-            reset_messages = ["分かりました。|||ここまでの会話をリセットしました。"]
-            send_with_fallback(
-                reply_token,
-                push_target,
-                format_line_messages(reset_messages[0]),
-            )
-            continue
-
-        try:
-            answer = create_ai_reply(conversation_key, user_text)
-            logger.info("STEP 4 AI回答生成成功 length=%d", len(answer))
-
-            line_messages = format_line_messages(answer)
-            send_with_fallback(reply_token, push_target, line_messages)
-
-        except Exception:
-            logger.exception("返信処理でエラーが発生しました。")
-
-            fallback_messages = [
-                "うまく処理できませんでした。",
-                "少し時間をおいて、もう一度送ってください。",
-            ]
-
-            try:
-                send_with_fallback(
-                    reply_token,
-                    push_target,
-                    fallback_messages,
-                )
-            except Exception:
-                logger.exception("フォールバックメッセージの送信にも失敗しました。")
+        threading.Thread(
+            target=process_event_async,
+            args=(event,),
+            daemon=True,
+        ).start()
 
     logger.info(
-        "Webhook処理完了 elapsed=%.2fs",
+        "Webhook即時応答 elapsed=%.3fs events=%d",
         time.time() - started_at,
+        len(events),
     )
+
     return "OK", 200
 
 
