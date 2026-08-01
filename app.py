@@ -305,11 +305,11 @@ response = openai_client.responses.create(
 )
 
 reply = (response.output_text or "").strip()
-    if not reply:
-        raise RuntimeError("OpenAIから空の回答が返されました。")
+if not reply:
+    raise RuntimeError("OpenAIから空の回答が返されました。")
 
-    save_history(conversation_key, "user", user_text)
-    save_history(conversation_key, "assistant", reply)
+save_history(conversation_key, "user", user_text)
+save_history(conversation_key, "assistant", reply)
 
     return reply
 
