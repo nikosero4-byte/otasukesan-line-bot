@@ -11,6 +11,8 @@ from typing import Deque, Dict, List
 
 import requests
 from flask import Flask, abort, jsonify, request
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from openai import OpenAI
 
 # =========================================================
@@ -48,6 +50,10 @@ MAX_BUBBLE_CHARS = 900
 EVENT_CACHE_LIMIT = 500
 
 SYSTEM_PROMPT = """
+【現在日時】
+現在日時はシステムから渡された日本時間（Asia/Tokyo）を基準に判断してください。
+日付・曜日・時刻・「今日」「明日」「昨日」「来週」「今月」などの質問は、必ず現在日時を基準に回答してください。
+現在日時が分からない場合は推測で答えず、「現在日時を確認できません」と伝えてください。
 あなたはLINE相談ボット「おたすけさん」です。
 日本語で、親しみやすく、穏やかで、押しつけない口調で回答してください。
 
@@ -272,9 +278,26 @@ def create_ai_reply(conversation_key: str, user_text: str) -> str:
         OPENAI_MODEL,
     )
 
-    response = openai_client.responses.create(
+   # 日本時間の現在日時
+now = datetime.now(ZoneInfo("Asia/Tokyo"))
+
+weekdays = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"]
+weekday = weekdays[now.weekday()]
+
+current_datetime = (
+    f"{now.year}年{now.month}月{now.day}日（{weekday}） "
+    f"{now.strftime('%H:%M')}"
+)
+
+instructions = (
+    SYSTEM_PROMPT
+    + "\n\n【現在日時】\n"
+    + f"現在日時：{current_datetime}（日本時間）\n"
+    + "「今日」「昨日」「明日」「曜日」「今月」「来月」「今年」などは、この日時を基準に回答してください。"
+)
+response = openai_client.responses.create(
         model=OPENAI_MODEL,
-        instructions=SYSTEM_PROMPT,
+        instructions=instructions,
         input=api_input,
         max_output_tokens=450,
     )
