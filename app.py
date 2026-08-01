@@ -297,21 +297,22 @@ instructions = (
     + f"現在日時：{current_datetime}（日本時間）\n"
     + "「今日」「昨日」「明日」「曜日」「今月」「来月」「今年」などは、この日時を基準に回答してください。"
 )
-response = openai_client.responses.create(
+    response = openai_client.responses.create(
         model=OPENAI_MODEL,
         instructions=instructions,
         input=api_input,
         max_output_tokens=450,
-)
+    )
 
-reply = (response.output_text or "").strip()
-if not reply:
-    raise RuntimeError("OpenAIから空の回答が返されました。")
+    reply = (response.output_text or "").strip()
 
-save_history(conversation_key, "user", user_text)
-save_history(conversation_key, "assistant", reply)
+    if not reply:
+        raise RuntimeError("OpenAIから空の回答が返されました。")
 
-return reply
+    save_history(conversation_key, "user", user_text)
+    save_history(conversation_key, "assistant", reply)
+
+    return reply
 
 
 def line_headers() -> dict:
