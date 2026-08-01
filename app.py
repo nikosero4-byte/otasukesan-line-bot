@@ -311,7 +311,7 @@ if not reply:
 save_history(conversation_key, "user", user_text)
 save_history(conversation_key, "assistant", reply)
 
-    return reply
+return reply
 
 
 def line_headers() -> dict:
