@@ -300,9 +300,9 @@ response = openai_client.responses.create(
         instructions=instructions,
         input=api_input,
         max_output_tokens=450,
-    )
+)
 
-    reply = (response.output_text or "").strip()
+reply = (response.output_text or "").strip()
     if not reply:
         raise RuntimeError("OpenAIから空の回答が返されました。")
 
