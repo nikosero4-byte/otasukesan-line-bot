@@ -280,39 +280,49 @@ def create_ai_reply(conversation_key: str, user_text: str) -> str:
         OPENAI_MODEL,
     )
 
-   # 日本時間の現在日時
-now = datetime.now(ZoneInfo("Asia/Tokyo"))
+    # 日本時間の現在日時
+    now = datetime.now(ZoneInfo("Asia/Tokyo"))
 
-weekdays = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"]
-weekday = weekdays[now.weekday()]
+    weekdays = [
+        "月曜日",
+        "火曜日",
+        "水曜日",
+        "木曜日",
+        "金曜日",
+        "土曜日",
+        "日曜日",
+    ]
+    weekday = weekdays[now.weekday()]
 
-current_datetime = (
-    f"{now.year}年{now.month}月{now.day}日（{weekday}） "
-    f"{now.strftime('%H:%M')}"
-)
+    current_datetime = (
+        f"{now.year}年{now.month}月{now.day}日（{weekday}） "
+        f"{now.strftime('%H:%M')}"
+    )
 
-instructions = (
-    SYSTEM_PROMPT
-    + "\n\n【現在日時】\n"
-    + f"現在日時：{current_datetime}（日本時間）\n"
-    + "「今日」「昨日」「明日」「曜日」「今月」「来月」「今年」などは、この日時を基準に回答してください。"
-)
-response = openai_client.responses.create(
-    model=OPENAI_MODEL,
-    instructions=instructions,
-    input=api_input,
-    max_output_tokens=450,
-)
+    instructions = (
+        SYSTEM_PROMPT
+        + "\n\n【現在日時】\n"
+        + f"現在日時：{current_datetime}（日本時間）\n"
+        + "「今日」「昨日」「明日」「曜日」「今月」「来月」「今年」などは、"
+        + "この日時を基準に回答してください。"
+    )
 
-reply = (response.output_text or "").strip()
+    response = openai_client.responses.create(
+        model=OPENAI_MODEL,
+        instructions=instructions,
+        input=api_input,
+        max_output_tokens=450,
+    )
 
-if not reply:
-    raise RuntimeError("OpenAIから空の回答が返されました。")
+    reply = (response.output_text or "").strip()
 
-save_history(conversation_key, "user", user_text)
-save_history(conversation_key, "assistant", reply)
+    if not reply:
+        raise RuntimeError("OpenAIから空の回答が返されました。")
 
-return reply
+    save_history(conversation_key, "user", user_text)
+    save_history(conversation_key, "assistant", reply)
+
+    return reply
 
 
 def line_headers() -> dict:
