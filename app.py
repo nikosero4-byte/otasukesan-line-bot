@@ -502,16 +502,13 @@ def callback():
     logger.info("STEP 2 署名確認成功 events=%d", len(events))
 
     for event in events:
-        threading.Thread(
-            target=process_event_async,
-            args=(event,),
-            daemon=True,
-        ).start()
+    process_event_async(event)
 
-    logger.info(
-        "Webhook即時応答 elapsed=%.3fs events=%d",
-        time.time() - started_at,
-        len(events),
+   logger.info(
+    "Webhook処理完了 elapsed=%.3fs events=%d",
+    time.time() - started_at,
+    len(events),
+)
     )
 
     return "OK", 200
