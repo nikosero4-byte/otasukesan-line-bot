@@ -16,16 +16,17 @@ from flask import Flask, abort, jsonify, request
 from openai import OpenAI
 
 # =========================================================
-# おたすけさん Ver1.1
+# おたすけさん Ver1.2（Cloud Run安定・診断版）
 # ・LINE向け短文返信
 # ・最大3つの吹き出し
 # ・ユーザーごとの直近会話を一時保持
 # ・エラー時の返信／pushフォールバック
-# ・Renderログ強化
+# ・OpenAI／LINE送信の詳細ログ
+# ・Cloud Runで止まりやすいバックグラウンドスレッドを廃止
 #
 # 注意：
 # 会話履歴はサーバーのメモリ内にだけ保存します。
-# Renderの再起動・再デプロイ・スリープ復帰などで消えることがあります。
+# Cloud Runの再起動・再デプロイなどで消えることがあります。
 # =========================================================
 
 app = Flask(__name__)
@@ -50,10 +51,6 @@ MAX_BUBBLE_CHARS = 900
 EVENT_CACHE_LIMIT = 500
 
 SYSTEM_PROMPT = """
-【現在日時】
-現在日時はシステムから渡された日本時間（Asia/Tokyo）を基準に判断してください。
-日付・曜日・時刻・「今日」「明日」「昨日」「来週」「今月」などの質問は、必ず現在日時を基準に回答してください。
-現在日時が分からない場合は推測で答えず、「現在日時を確認できません」と伝えてください。
 あなたはLINE相談ボット「おたすけさん」です。
 日本語で、親しみやすく、穏やかで、押しつけない口調で回答してください。
 
@@ -82,20 +79,22 @@ SYSTEM_PROMPT = """
 ・自傷、他害、重大な犯罪などの危険がある場合は、安全確保と緊急支援を優先する。
 
 【現在の機能上の制限】
-・リアルタイムの天気、電車時刻、道路状況、店舗の営業状況などは、
+・リアルタイムの天気、電車時刻、道路状況、店舗の営業状況などを、
   外部APIなしで正確に取得することはできない。
-・ただし、現在日時はシステムから渡された日本時間を使って回答する。
-・日付、曜日、現在時刻、「今日」「明日」「昨日」「来週」などは、
-  システムから渡された現在日時を基準に答える。
 ・最新情報を取得できない場合は、推測で答えず、
   「現在は最新情報を直接確認できません」と短く伝える。
 ・ただし、直前に出た地名や話題は忘れず、会話として自然につなげる。
+
 【出力例】
 それはつらいですね。|||動くときに強く痛みますか？|||無理に動かさず、急な強い痛みやしびれがあれば医療機関への相談も検討してください。
 """.strip()
 
 # OpenAIクライアントは使い回す
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+openai_client = (
+    OpenAI(api_key=OPENAI_API_KEY, timeout=35.0, max_retries=1)
+    if OPENAI_API_KEY
+    else None
+)
 
 # ユーザーごとの一時的な会話履歴
 conversation_history: Dict[str, Deque[dict]] = defaultdict(
@@ -194,6 +193,17 @@ def clear_history(conversation_key: str) -> None:
         conversation_history.pop(conversation_key, None)
 
 
+def get_japan_datetime_context() -> str:
+    """現在の日本日時をAIへ渡すための短い補足文を作る。"""
+    now = datetime.now(ZoneInfo("Asia/Tokyo"))
+    weekdays = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"]
+    return (
+        f"現在の日本日時は{now.year}年{now.month}月{now.day}日"
+        f"{weekdays[now.weekday()]} {now.strftime('%H:%M')}です。"
+        "日時を尋ねられた場合は、この情報を基準に正確に答えてください。"
+    )
+
+
 def split_long_text(text: str, limit: int = MAX_BUBBLE_CHARS) -> List[str]:
     """長すぎる文章を、文の切れ目を優先して分割する。"""
     text = text.strip()
@@ -265,63 +275,60 @@ def format_line_messages(answer: str) -> List[str]:
 def create_ai_reply(conversation_key: str, user_text: str) -> str:
     """直近の会話履歴を含めてOpenAI APIから返信を作る。"""
     if not openai_client:
-        return (
-            "ただいまAIの設定準備中です。|||"
-            "少し時間をおいて、もう一度お試しください。"
-        )
+        raise RuntimeError("OPENAI_API_KEY が設定されていません。")
 
     history = load_history(conversation_key)
     api_input = history + [{"role": "user", "content": user_text}]
+    instructions = f"{SYSTEM_PROMPT}\n\n【現在日時】\n{get_japan_datetime_context()}"
 
+    started_at = time.time()
     logger.info(
-        "STEP 3 OpenAIへ送信 conversation=%s history=%d model=%s",
+        "STEP 3 OpenAI送信開始 conversation=%s history=%d model=%s text_length=%d",
         conversation_key,
         len(history),
         OPENAI_MODEL,
+        len(user_text),
     )
 
-    # 日本時間の現在日時
-    now = datetime.now(ZoneInfo("Asia/Tokyo"))
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=instructions,
+            input=api_input,
+            max_output_tokens=450,
+        )
+    except Exception:
+        logger.exception(
+            "STEP 3 OpenAI呼び出し失敗 conversation=%s elapsed=%.2fs",
+            conversation_key,
+            time.time() - started_at,
+        )
+        raise
 
-    weekdays = [
-        "月曜日",
-        "火曜日",
-        "水曜日",
-        "木曜日",
-        "金曜日",
-        "土曜日",
-        "日曜日",
-    ]
-    weekday = weekdays[now.weekday()]
-
-    current_datetime = (
-        f"{now.year}年{now.month}月{now.day}日（{weekday}） "
-        f"{now.strftime('%H:%M')}"
-    )
-
-    instructions = (
-        SYSTEM_PROMPT
-        + "\n\n【現在日時】\n"
-        + f"現在日時：{current_datetime}（日本時間）\n"
-        + "「今日」「昨日」「明日」「曜日」「今月」「来月」「今年」などは、"
-        + "この日時を基準に回答してください。"
-    )
-
-    response = openai_client.responses.create(
-        model=OPENAI_MODEL,
-        instructions=instructions,
-        input=api_input,
-        max_output_tokens=450,
+    logger.info(
+        "STEP 3 OpenAI応答受信 conversation=%s elapsed=%.2fs response_id=%s",
+        conversation_key,
+        time.time() - started_at,
+        getattr(response, "id", "unknown"),
     )
 
     reply = (response.output_text or "").strip()
-
     if not reply:
+        logger.error(
+            "STEP 3 OpenAI空回答 conversation=%s response_id=%s",
+            conversation_key,
+            getattr(response, "id", "unknown"),
+        )
         raise RuntimeError("OpenAIから空の回答が返されました。")
 
     save_history(conversation_key, "user", user_text)
     save_history(conversation_key, "assistant", reply)
 
+    logger.info(
+        "STEP 4 AI回答生成成功 conversation=%s length=%d",
+        conversation_key,
+        len(reply),
+    )
     return reply
 
 
@@ -341,6 +348,9 @@ def to_line_message_objects(texts: List[str]) -> List[dict]:
 
 def reply_to_line(reply_token: str, texts: List[str]) -> None:
     """replyTokenを使ってLINEへ返信する。"""
+    started_at = time.time()
+    logger.info("STEP 5 LINE reply送信開始 bubbles=%d", len(texts))
+
     response = requests.post(
         LINE_REPLY_URL,
         headers=line_headers(),
@@ -349,6 +359,13 @@ def reply_to_line(reply_token: str, texts: List[str]) -> None:
             "messages": to_line_message_objects(texts),
         },
         timeout=20,
+    )
+
+    logger.info(
+        "STEP 5 LINE reply応答 status=%s elapsed=%.2fs body=%s",
+        response.status_code,
+        time.time() - started_at,
+        response.text[:500],
     )
 
     if not response.ok:
@@ -362,9 +379,16 @@ def reply_to_line(reply_token: str, texts: List[str]) -> None:
 
 
 def push_to_line(target: str, texts: List[str]) -> None:
-    """replyTokenが期限切れ等の場合、push送信を試す。"""
+    """replyTokenが使えない場合、push送信を試す。"""
     if not target:
         raise RuntimeError("push送信先を取得できませんでした。")
+
+    started_at = time.time()
+    logger.info(
+        "STEP 5 LINE push送信開始 target_suffix=%s bubbles=%d",
+        target[-6:] if len(target) >= 6 else target,
+        len(texts),
+    )
 
     response = requests.post(
         LINE_PUSH_URL,
@@ -374,6 +398,13 @@ def push_to_line(target: str, texts: List[str]) -> None:
             "messages": to_line_message_objects(texts),
         },
         timeout=20,
+    )
+
+    logger.info(
+        "STEP 5 LINE push応答 status=%s elapsed=%.2fs body=%s",
+        response.status_code,
+        time.time() - started_at,
+        response.text[:500],
     )
 
     if not response.ok:
@@ -405,7 +436,7 @@ def send_with_fallback(
 def health_check():
     return jsonify(
         status="ok",
-        version="1.1",
+        version="1.2",
         service="おたすけさんLINEボット",
         message="サーバーは正常に動いています。",
         openai_configured=bool(OPENAI_API_KEY),
@@ -413,75 +444,6 @@ def health_check():
             LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN
         ),
     )
-
-
-def process_event_async(event: dict) -> None:
-    """Webhookへの200応答後に、実際の返信処理を行う。"""
-    try:
-        if is_duplicate_event(event):
-            logger.info("重複イベントのためスキップしました。")
-            return
-
-        if event.get("type") != "message":
-            logger.info("message以外のイベントをスキップしました。")
-            return
-
-        message = event.get("message", {})
-        if message.get("type") != "text":
-            logger.info("テキスト以外のメッセージをスキップしました。")
-            return
-
-        push_target = get_push_target(event)
-        conversation_key = get_conversation_key(event)
-        user_text = (message.get("text") or "").strip()
-
-        if not push_target or not user_text:
-            logger.warning("push送信先または本文が空のためスキップしました。")
-            return
-
-        logger.info(
-            "非同期処理開始 conversation=%s text_length=%d",
-            conversation_key,
-            len(user_text),
-        )
-
-        if user_text in {"会話をリセット", "履歴を消して", "リセット"}:
-            clear_history(conversation_key)
-            push_to_line(
-                push_target,
-                format_line_messages(
-                    "分かりました。|||ここまでの会話をリセットしました。"
-                ),
-            )
-            return
-
-        answer = create_ai_reply(conversation_key, user_text)
-        logger.info("AI回答生成成功 length=%d", len(answer))
-
-        line_messages = format_line_messages(answer)
-        push_to_line(push_target, line_messages)
-
-        logger.info(
-            "LINE push成功 conversation=%s bubbles=%d",
-            conversation_key,
-            len(line_messages),
-        )
-
-    except Exception:
-        logger.exception("非同期返信処理でエラーが発生しました。")
-
-        try:
-            push_target = get_push_target(event)
-            if push_target:
-                push_to_line(
-                    push_target,
-                    [
-                        "うまく処理できませんでした。",
-                        "少し時間をおいて、もう一度送ってください。",
-                    ],
-                )
-        except Exception:
-            logger.exception("フォールバック送信にも失敗しました。")
 
 
 @app.post("/callback")
@@ -501,19 +463,82 @@ def callback():
 
     logger.info("STEP 2 署名確認成功 events=%d", len(events))
 
+    # LINE Developersの「検証」ではeventsが空の場合がある
     for event in events:
-        threading.Thread(
-            target=process_event_async,
-            args=(event,),
-            daemon=True,
-        ).start()
+        if is_duplicate_event(event):
+            logger.info("重複イベントのためスキップしました。")
+            continue
+
+        if event.get("type") != "message":
+            logger.info("message以外のイベントをスキップしました。")
+            continue
+
+        message = event.get("message", {})
+        if message.get("type") != "text":
+            logger.info("テキスト以外のメッセージをスキップしました。")
+            continue
+
+        reply_token = event.get("replyToken", "")
+        push_target = get_push_target(event)
+        conversation_key = get_conversation_key(event)
+        user_text = (message.get("text") or "").strip()
+
+        if not reply_token or not user_text:
+            logger.warning("replyTokenまたは本文が空のためスキップしました。")
+            continue
+
+        logger.info(
+            "受信 conversation=%s text_length=%d",
+            conversation_key,
+            len(user_text),
+        )
+
+        # 利用者が明示的に会話をリセットできる
+        if user_text in {"会話をリセット", "履歴を消して", "リセット"}:
+            clear_history(conversation_key)
+            reset_messages = ["分かりました。|||ここまでの会話をリセットしました。"]
+            send_with_fallback(
+                reply_token,
+                push_target,
+                format_line_messages(reset_messages[0]),
+            )
+            continue
+
+        try:
+            # Cloud RunではHTTP応答後のバックグラウンドスレッドが
+            # CPU停止で途中中断されることがあるため、ここで最後まで処理する。
+            answer = create_ai_reply(conversation_key, user_text)
+            line_messages = format_line_messages(answer)
+
+            logger.info(
+                "STEP 4 LINE整形成功 conversation=%s bubbles=%d",
+                conversation_key,
+                len(line_messages),
+            )
+            send_with_fallback(reply_token, push_target, line_messages)
+
+        except Exception:
+            logger.exception("返信処理でエラーが発生しました。")
+
+            fallback_messages = [
+                "うまく処理できませんでした。",
+                "少し時間をおいて、もう一度送ってください。",
+            ]
+
+            try:
+                send_with_fallback(
+                    reply_token,
+                    push_target,
+                    fallback_messages,
+                )
+            except Exception:
+                logger.exception("フォールバックメッセージの送信にも失敗しました。")
 
     logger.info(
-        "Webhook即時応答 elapsed=%.3fs events=%d",
+        "Webhook処理完了 elapsed=%.2fs events=%d",
         time.time() - started_at,
         len(events),
     )
-
     return "OK", 200
 
 
