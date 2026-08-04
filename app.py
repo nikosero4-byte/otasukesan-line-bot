@@ -7,12 +7,12 @@ import re
 import threading
 import time
 from collections import defaultdict, deque
+from datetime import datetime
 from typing import Deque, Dict, List
+from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, abort, jsonify, request
-from datetime import datetime
-from zoneinfo import ZoneInfo
 from openai import OpenAI
 
 # =========================================================
@@ -501,20 +501,21 @@ def callback():
 
     logger.info("STEP 2 署名確認成功 events=%d", len(events))
 
-for event in events:
-    threading.Thread(
-        target=process_event_async,
-        args=(event,),
-        daemon=True,
-    ).start()
+    for event in events:
+        threading.Thread(
+            target=process_event_async,
+            args=(event,),
+            daemon=True,
+        ).start()
 
-logger.info(
-    "Webhook即時応答 elapsed=%.3fs events=%d",
-    time.time() - started_at,
-    len(events),
-)
+    logger.info(
+        "Webhook即時応答 elapsed=%.3fs events=%d",
+        time.time() - started_at,
+        len(events),
+    )
 
-return "OK", 200
+    return "OK", 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
